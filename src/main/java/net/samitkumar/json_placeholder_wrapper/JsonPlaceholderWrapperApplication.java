@@ -7,12 +7,15 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
+import org.springframework.stereotype.Component;
 import org.springframework.stereotype.Service;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.support.WebClientAdapter;
 import org.springframework.web.reactive.function.server.RouterFunction;
 import org.springframework.web.reactive.function.server.RouterFunctions;
+import org.springframework.web.reactive.function.server.ServerRequest;
 import org.springframework.web.reactive.function.server.ServerResponse;
 import org.springframework.web.service.annotation.GetExchange;
 import org.springframework.web.service.annotation.HttpExchange;
@@ -39,8 +42,8 @@ public class JsonPlaceholderWrapperApplication {
 	JsonPlaceHolderClient jsonPlaceHolderClient(WebClient.Builder clientBuilder) {
 
 		var builder = clientBuilder
-				//.baseUrl("https://jsonplaceholder.typicode.com/")
-				.baseUrl("http://localhost:3000")
+				.baseUrl("https://jsonplaceholder.typicode.com/")
+				//.baseUrl("http://localhost:3000")
 				.filter(ExchangeFilterFunction.ofResponseProcessor(clientResponse -> {
 					var statusCode = clientResponse.statusCode();
 					var uri = clientResponse.request().getURI();
@@ -62,22 +65,54 @@ public class JsonPlaceholderWrapperApplication {
 	}
 
 	@Bean
-	RouterFunction<ServerResponse> routes(Flux<List<User>> cachedUsers) {
+	RouterFunction<ServerResponse> routes(RouterHandler routerHandler) {
 		return RouterFunctions
 				.route()
-				.GET("/users", request -> cachedUsers.next()
-						.flatMap(ServerResponse.ok()::bodyValue))
+				.path("/users", path -> path
+						.GET("", routerHandler::allUsers)
+						.GET("/{id}", routerHandler::getUserById)
+				)
 				.build();
 	}
-
 }
 
-record User(int id, String name, String username, String email) {}
+record User(int id, String name, String username, String email, Address address, List<Post> posts) {}
+record Address(String street, String suite, String city, String zipcode) {}
+record Post(int userId, int id, String title, String body) {}
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+class RouterHandler {
+	private final Flux<List<User>> cachedUsers;
+	private final JsonPlaceHolderClient jsonPlaceHolderClient;
+
+	public Mono<ServerResponse> getUserById(ServerRequest request) {
+		var id = Integer.parseInt(request.pathVariable("id"));
+		return cachedUsers
+				.next()
+				.map(users -> users.stream().filter(u -> u.id() == id).findFirst())
+				//TODO can this be prevent the second call to getPosts if the user is not found?
+				.zipWith(jsonPlaceHolderClient.getPosts(id),
+						(user, posts) -> user
+								.map(u -> new User(u.id(), u.name(), u.username(), u.email(), u.address(), posts)))
+				.flatMap(user -> user.map(ServerResponse.ok()::bodyValue)
+						.orElseGet(() -> ServerResponse.notFound().build()));
+	}
+
+	public Mono<ServerResponse> allUsers(ServerRequest request) {
+		return cachedUsers.next().flatMap(ServerResponse.ok()::bodyValue);
+	}
+}
 
 @HttpExchange
 interface JsonPlaceHolderClient {
 	@GetExchange("/users")
 	Mono<List<User>> getUsers();
+
+	@GetExchange("/posts")
+	Mono<List<Post>> getPosts(@RequestParam("userId") int userId);
+
 }
 
 @Service
@@ -100,7 +135,7 @@ class CacheService {
 				})
 				.doOnError(error -> log.error("Users fetch FAILED", error))
 				.cache(
-						listOfUsers -> Duration.ofMinutes(1),
+						listOfUsers -> Duration.ofMinutes(10),
 						(Throwable t )-> Duration.ZERO,
 						() -> Duration.ZERO
 				)
