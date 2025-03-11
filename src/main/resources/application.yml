@@ -1,0 +1,9 @@
+spring:
+  application:
+    name: json-placeholder-wrapper
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: '*'

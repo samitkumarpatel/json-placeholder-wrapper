@@ -19,6 +19,9 @@ import org.springframework.web.service.annotation.HttpExchange;
 import org.springframework.web.service.invoker.HttpServiceProxyFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.ReplayProcessor;
+import reactor.core.publisher.Sinks;
+import reactor.core.scheduler.Schedulers;
 import reactor.netty.http.client.HttpClient;
 
 import java.time.Duration;
@@ -33,15 +36,16 @@ public class JsonPlaceholderWrapperApplication {
 	}
 
 	@Bean
-	public JsonPlaceHolderClient jsonPlaceHolderClient(WebClient.Builder clientBuilder) {
+	JsonPlaceHolderClient jsonPlaceHolderClient(WebClient.Builder clientBuilder) {
 
 		var builder = clientBuilder
-				.baseUrl("https://jsonplaceholder.typicode.com/")
+				//.baseUrl("https://jsonplaceholder.typicode.com/")
+				.baseUrl("http://localhost:3000")
 				.filter(ExchangeFilterFunction.ofResponseProcessor(clientResponse -> {
 					var statusCode = clientResponse.statusCode();
 					var uri = clientResponse.request().getURI();
 					var method = clientResponse.request().getMethod();
-					log.info("method: {}, uri: {}, status: {}", method, uri, statusCode);
+					log.info("{} {} {}", method, uri, statusCode);
 					return Mono.just(clientResponse);
 				}))
 				.clientConnector(new ReactorClientHttpConnector(
@@ -58,10 +62,11 @@ public class JsonPlaceholderWrapperApplication {
 	}
 
 	@Bean
-	RouterFunction<ServerResponse> routes(CacheService cacheService) {
+	RouterFunction<ServerResponse> routes(Flux<List<User>> cachedUsers) {
 		return RouterFunctions
 				.route()
-				.GET("/users", request -> cacheService.getCachedUsers().flatMap(ServerResponse.ok()::bodyValue))
+				.GET("/users", request -> cachedUsers.next()
+						.flatMap(ServerResponse.ok()::bodyValue))
 				.build();
 	}
 
@@ -76,45 +81,31 @@ interface JsonPlaceHolderClient {
 }
 
 @Service
-@Slf4j
-@RequiredArgsConstructor
-class UserService {
-	private final JsonPlaceHolderClient client;
-
-	public Mono<List<User>> getUsers() {
-		log.info("### UserService::getUsers()");
-		return client
-				.getUsers()
-				.doOnSuccess(users -> log.info("UserService::getUsers() SUCCESS with size {}", users.size()))
-				.doOnError(error -> log.error("UserService::getUsers() FAILED", error));
-	}
-}
-
-@Service
 @RequiredArgsConstructor
 @Slf4j
 class CacheService {
-	private final UserService userService;
+	private final JsonPlaceHolderClient jsonPlaceHolderClient;
+	// This is to use the Old success data if the new data fetch fails.
+	Sinks.Many<List<User>> sink = Sinks.many().replay().latest();
 
-	public Mono<List<User>> getCachedUsers() {
-		return cachedUsers()
-				.next();
-	}
-
-	private Mono<List<User>> allUsers() {
-		log.info("#### CacheService::allUsers()");
-		return userService
-				.getUsers();
-	}
-
-	private Flux<List<User>> cachedUsers() {
+	//make sure to create a bean of this method and use it.
+	@Bean
+	Flux<List<User>> cachedUsers() {
 		return Mono.just("repeatable")
-				.flatMap(s -> allUsers())
+				.flatMap(s -> jsonPlaceHolderClient.getUsers())
+				.doOnSuccess(users -> {
+					log.info("Users fetched SUCCESSFULLY");
+					//TODO not useful yet, but can be useful if we want to use the old data if the new data fetch fails.
+					sink.tryEmitNext(users);
+				})
+				.doOnError(error -> log.error("Users fetch FAILED", error))
 				.cache(
-						listOfUsers -> Duration.ofMinutes(1L),
-						(throwable -> Duration.ZERO),
+						listOfUsers -> Duration.ofMinutes(1),
+						(Throwable t )-> Duration.ZERO,
 						() -> Duration.ZERO
 				)
+				//TODO find a way to pick the previous data from sink if the new data fetch fails.
 				.repeat();
+
 	}
 }
